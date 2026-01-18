@@ -1,0 +1,398 @@
+// ========================
+// 0. 参数与资产路径
+// ========================
+var PARAMS = {
+  seed: 1,
+  scale: 30,                  // 30m
+  pos_samples_per_poly: 20,   // 每个Polygon取点
+  neg_pos_ratio: 4,           // 负样本=正样本*倍数
+  pos_rect_size: 60,          // 真样本矩形边长60m
+  neg_rect_size: 90,          // 假样本矩形边长90m
+  split_ratio: 0.7,           // 7:3
+  rf_trees: 200,              // 200棵树
+  
+  // --- 模型投票权重参数 ---
+  prob_threshold: 0.7,        // 最终概率阈值
+  weight_feature: 0.4,        // 特征影像模型权重
+  weight_embedding: 0.6,      // Embedding模型权重
+  
+  // --- 波段选择参数 ---
+  top_k_bands: 20,            // 只选择前20个重要Embedding波段
+  
+  viirs_threshold: 5,         // 夜光阈值
+  viirs_focal_radius_px: 1,   // 夜光掩膜平滑半径(像素)
+  min_patch_pixels: 4,        // 斑块过滤：<4像素去除
+  morph_radius_m: 45,         // 形态学聚合（Closing）
+  
+  export_folder: 'GEE_APV_db_4x',
+  export_vectors_desc: 'APV_db_4x',
+  export_metrics_desc: 'APV_db_ACCURACYREPORT_4x'
+};
+
+// --- 资产加载 ---
+var roi = ee.FeatureCollection('users/nathanchen011126/climate_db').geometry().simplify(100);
+var truePolysSource = ee.FeatureCollection('projects/tiebian/assets/apv_train_db');
+var falsePointsSource = ee.FeatureCollection('projects/tiebian/assets/fake_nega_db_add_grid'); 
+var featureImgRaw = ee.Image('projects/tiebian/assets/APV_allFeatures_S2_30m_db');
+
+// 嵌入数据
+var embeddingRaw = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL')
+  .filterDate('2023-01-01', '2024-01-01')
+  .filterBounds(roi)
+  .median();
+
+// --- 投影标准化 ---
+// 使用特征影像的投影作为基准
+var baseProj = featureImgRaw.projection();
+var crs = baseProj.crs(); 
+
+// ========================
+// 1. 数据预处理与掩膜
+// ========================
+
+// 1.1 制作夜光掩膜
+var viirs = ee.ImageCollection('NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG')
+  .filterDate('2023-01-01', '2023-12-31')
+  .select('avg_rad')
+  .median()
+  .clip(roi);
+
+// 逻辑：小于阈值 -> 膨胀平滑 -> 切片
+var rural_mask = viirs.lt(PARAMS.viirs_threshold)
+  .reproject({crs: crs, scale: 500}) // 在低分辨率下做初步判定
+  .focal_max({radius: PARAMS.viirs_focal_radius_px, units: 'pixels'})
+  .reproject({crs: crs, scale: PARAMS.scale}) // 重投影回30m
+  .clip(roi);
+
+// 1.2 准备特征影像 (应用掩膜)
+var featureBands = featureImgRaw.bandNames();
+var featureStack = featureImgRaw
+  .select(featureBands)
+  .updateMask(rural_mask)
+  .clip(roi);
+
+// 1.3 准备Embedding影像 (重命名 + 应用掩膜)
+var embedBandsRaw = embeddingRaw.bandNames();
+// 重命名防止波段冲突: A01 -> emb_A01
+var embedBandsAll = embedBandsRaw.map(function(b){ return ee.String('emb_').cat(ee.String(b)); });
+var embedding = embeddingRaw
+  .select(embedBandsRaw)
+  .rename(embedBandsAll) // 先保留所有波段，稍后筛选
+  .updateMask(rural_mask)
+  .clip(roi)
+  .reproject({crs: crs, scale: PARAMS.scale}); // 强制对齐分辨率
+
+// 1.4 组合全量堆栈 (用于采样)
+var samplingStack = featureStack.addBands(embedding);
+
+// ========================
+// 2. 取样与数据集划分
+// ========================
+
+// 辅助函数：转为矩形 Feature
+var toRect = function(feature, size, label) {
+  var geom = feature.geometry();
+  return ee.Feature(geom.buffer(size / 2).bounds())
+    .set('class', label);
+};
+
+// 2.1 真样本：Map + Flatten
+var truePoints = truePolysSource.map(function(poly){
+  return ee.FeatureCollection.randomPoints({
+    region: poly.geometry(),
+    points: PARAMS.pos_samples_per_poly,
+    seed: PARAMS.seed
+  });
+}).flatten();
+
+var trueRects = truePoints.map(function(f){ return toRect(f, PARAMS.pos_rect_size, 1); });
+
+// 2.2 负样本 (已修改：保证code=111样本占比>=10%)
+var trueCount = trueRects.size();
+var totalFalseCount = trueCount.multiply(PARAMS.neg_pos_ratio);
+
+// --- 逻辑修改开始 ---
+// 1. 计算111类和非111类的目标数量
+// 使用 ceil() 向上取整 0.3为至少30%的手动样本
+var count111Target = totalFalseCount.multiply(0.3).ceil(); 
+var countOtherTarget = totalFalseCount.subtract(count111Target);
+
+// 2. 拆分负样本源
+var source111 = falsePointsSource.filter(ee.Filter.eq('code', 111));
+var sourceOther = falsePointsSource.filter(ee.Filter.neq('code', 111)); // 也可以用 distinct 或者其他逻辑，这里假设除111外都是普通负样本
+
+// 3. 分别随机取样
+var falseRects111 = source111
+  .randomColumn('rand', PARAMS.seed)
+  .sort('rand')
+  .limit(count111Target)
+  .map(function(f){ return toRect(f, PARAMS.neg_rect_size, 0); });
+
+var falseRectsOther = sourceOther
+  .randomColumn('rand', PARAMS.seed)
+  .sort('rand')
+  .limit(countOtherTarget)
+  .map(function(f){ return toRect(f, PARAMS.neg_rect_size, 0); });
+
+// 4. 合并得到最终负样本 (变量名保持为 falseRects 以兼容后续代码)
+var falseRects = falseRects111.merge(falseRectsOther);
+// --- 逻辑修改结束 ---
+
+// 2.3 合并与 Feature 级划分
+var allRects = trueRects.merge(falseRects);
+var allRectsWithSplit = allRects.randomColumn('split_rand', PARAMS.seed);
+
+var trainRects = allRectsWithSplit.filter(ee.Filter.lt('split_rand', PARAMS.split_ratio));
+var testRects  = allRectsWithSplit.filter(ee.Filter.gte('split_rand', PARAMS.split_ratio));
+
+// 2.4 提取像素值 (SampleRegions)
+var trainSamples = samplingStack.sampleRegions({
+  collection: trainRects,
+  properties: ['class'],
+  scale: PARAMS.scale,
+  tileScale: 16,
+  geometries: false
+});
+
+var testSamples = samplingStack.sampleRegions({
+  collection: testRects,
+  properties: ['class'],
+  scale: PARAMS.scale,
+  tileScale: 16,
+  geometries: false
+});
+
+// ===========================================
+// 2.5 Embedding 波段选择 (Top K)
+// ===========================================
+
+// 定义波段选择函数
+var selectTopBands = function(samples, inputBands, topK) {
+  // 【修复】增加随机列并排序，确保 limit 拿到的 5000 个点包含 0 和 1
+  var shuffledSamples = samples
+    .randomColumn('temp_rand')
+    .sort('temp_rand')
+    .limit(5000);
+    
+  var selectorRF = ee.Classifier.smileRandomForest({
+    numberOfTrees: 30, 
+    seed: PARAMS.seed
+  }).train({
+    features: shuffledSamples, // 使用打乱后的子集
+    classProperty: 'class',
+    inputProperties: inputBands
+  });
+  
+  var importanceDict = selectorRF.explain().get('importance');
+  
+  var kvList = ee.Dictionary(importanceDict).keys().map(function(key){
+    return ee.Feature(null, {
+      'band': key, 
+      'score': ee.Dictionary(importanceDict).get(key)
+    });
+  });
+  
+  var sortedFC = ee.FeatureCollection(kvList).sort('score', false);
+  return sortedFC.limit(topK).aggregate_array('band');
+};
+
+var bestEmbedBands = selectTopBands(trainSamples, embedBandsAll, PARAMS.top_k_bands);
+print('筛选出的最佳波段:', bestEmbedBands);
+
+// ========================
+// 3. 模型训练 (双RF)
+// ========================
+
+var rfBase = ee.Classifier.smileRandomForest({
+  numberOfTrees: PARAMS.rf_trees, 
+  minLeafPopulation: 3,            
+  seed: PARAMS.seed
+});
+
+// 模型1：特征影像
+var rfFeature = rfBase.train({
+  features: trainSamples,
+  classProperty: 'class',
+  inputProperties: featureBands
+}).setOutputMode('MULTIPROBABILITY');
+
+// 模型2：Embedding
+var rfEmbed = rfBase.train({
+  features: trainSamples,
+  classProperty: 'class',
+  inputProperties: bestEmbedBands 
+}).setOutputMode('MULTIPROBABILITY');
+
+// ========================
+// 4. 原始精度验证 (加权融合)
+// ========================
+
+// 辅助函数：添加预测概率和融合结果
+var addProbsAndPred = function(samples) {
+  // 1. 特征模型预测
+  var s1 = samples.classify(rfFeature).map(function(f){
+    var probs = ee.Array(f.get('classification')); 
+    return f.set('prob_feat_pos', probs.get([1]));
+  });
+
+  // 2. Embedding模型预测 + 加权融合
+  var s2 = s1.classify(rfEmbed).map(function(f){
+    var probs = ee.Array(f.get('classification'));
+    var p_emb = ee.Number(probs.get([1]));
+    var p_feat = ee.Number(f.get('prob_feat_pos'));
+    
+    // 融合逻辑
+    var weighted_prob = p_feat.multiply(PARAMS.weight_feature)
+                          .add(p_emb.multiply(PARAMS.weight_embedding));
+    
+    var is_pos = weighted_prob.gt(PARAMS.prob_threshold);
+                  
+    return f.set({
+      'prob_emb_pos': p_emb,
+      'pred': is_pos.int() 
+    });
+  });
+  return s2;
+};
+
+// 辅助函数：从FeatureCollection计算指标
+var getMetrics = function(fc, predProperty) {
+  var cm = fc.errorMatrix('class', predProperty);
+  return {
+    oa: cm.accuracy(),
+    kappa: cm.kappa(),
+    pa_pos: cm.producersAccuracy().get([1, 0]), 
+    ua_pos: cm.consumersAccuracy().get([0, 1])  
+  };
+};
+
+// 计算原始预测（Pixel-based Raw Accuracy）
+var trainPredFC = addProbsAndPred(trainSamples);
+var testPredFC  = addProbsAndPred(testSamples);
+
+var trainM = getMetrics(trainPredFC, 'pred');
+var testM  = getMetrics(testPredFC, 'pred');
+
+// ========================
+// 5. 全图分类与后处理 
+// ========================
+
+// 5.1 获取概率图
+var probFeat = featureStack.classify(rfFeature).arrayGet([1]);
+var probEmb  = embedding.select(bestEmbedBands)
+  .classify(rfEmbed)
+  .arrayGet([1]);
+
+// 5.2 融合概率
+var probFinal = probFeat.multiply(PARAMS.weight_feature)
+                  .add(probEmb.multiply(PARAMS.weight_embedding));
+
+// 5.3 初始掩膜
+var apvMask0 = probFinal.gt(PARAMS.prob_threshold).selfMask();
+
+// --- 改进后的后处理流程 ---
+
+// A. 平滑去噪 (众数滤波)
+var apvMaskSmooth = apvMask0.focal_mode({
+  radius: 2,
+  kernelType: 'square',
+  units: 'pixels',
+  iterations: 1
+});
+
+// 定义形态学核
+var morphKernel = {radius: PARAMS.morph_radius_m, units: 'meters'};
+
+// B. 形态学开运算 (Opening: 腐蚀 -> 膨胀) - 去除孤立噪点
+var apvMaskClean = apvMaskSmooth
+  .focal_min(morphKernel)
+  .focal_max(morphKernel);
+
+// C. 第一次面积过滤 (增强版：修复投影问题)
+var filterSmall = function(img, minPx) {
+  // 显式指定投影，防止在connectedPixelCount中因默认投影导致计数错误
+  // 使用之前定义的标准 crs 和 scale
+  var count = img.connectedPixelCount({maxSize: 100, eightConnected: true});
+  return img.updateMask(count.gte(minPx));
+};
+
+var apvMaskFiltered1 = filterSmall(apvMaskClean.reproject({crs: crs, scale: PARAMS.scale}), PARAMS.min_patch_pixels);
+
+// D. 形态学闭运算 (Closing: 膨胀 -> 腐蚀) - 填补空洞
+var apvMaskClosed = apvMaskFiltered1
+  .focal_max(morphKernel)
+  .focal_min(morphKernel);
+
+// E. 最终过滤与剪裁 (重投影确保最终一致性)
+var apvMaskFinal = filterSmall(apvMaskClosed.reproject({crs: crs, scale: PARAMS.scale}), PARAMS.min_patch_pixels)
+  .clip(roi);
+
+// ========================
+// 5.6 后处理精度验证 (新增)
+// ========================
+
+
+// 1. 准备验证底图：必须 unmask(0) 将 NoData 填回 0，否则背景负样本会被忽略
+var finalMapForValidation = apvMaskFinal.unmask(0).rename('pred_final');
+
+// 2. 使用之前的测试集 (testRects) 进行采样
+// 这一步模拟了“如果我们用这套后处理规则去预测测试区域，结果如何”
+var testSamplesFinal = finalMapForValidation.sampleRegions({
+  collection: testRects, 
+  properties: ['class'],
+  scale: PARAMS.scale,
+  tileScale: 16,
+  geometries: false
+});
+
+// 3. 计算最终指标
+var metricsFinal = getMetrics(testSamplesFinal, 'pred_final');
+
+
+// ========================
+// 6. 导出
+// ========================
+
+// 6.1 转矢量
+var vectors = apvMaskFinal.toByte().reduceToVectors({
+  geometry: roi,
+  scale: PARAMS.scale,
+  crs: crs,
+  geometryType: 'polygon',
+  eightConnected: true,
+  labelProperty: 'class',
+  reducer: ee.Reducer.countEvery(),
+  maxPixels: 1e13,
+  tileScale: 16
+});
+
+Export.table.toDrive({
+  collection: vectors,
+  description: PARAMS.export_vectors_desc,
+  folder: PARAMS.export_folder,
+  fileFormat: 'SHP'
+});
+
+// 6.2 导出精度CSV (包含原始和最终精度)
+var accFeatures = ee.FeatureCollection([
+  ee.Feature(null, {
+    'Type': 'Train_Raw',
+    'OA': trainM.oa, 'Kappa': trainM.kappa, 'PA_Pos': trainM.pa_pos, 'UA_Pos': trainM.ua_pos
+  }),
+  ee.Feature(null, {
+    'Type': 'Test_Raw',
+    'OA': testM.oa, 'Kappa': testM.kappa, 'PA_Pos': testM.pa_pos, 'UA_Pos': testM.ua_pos
+  }),
+  ee.Feature(null, {
+    'Type': 'Test_Final_PostProcessed', // 新增行
+    'OA': metricsFinal.oa, 'Kappa': metricsFinal.kappa, 
+    'PA_Pos': metricsFinal.pa_pos, 'UA_Pos': metricsFinal.ua_pos
+  })
+]);
+
+Export.table.toDrive({
+  collection: accFeatures,
+  description: PARAMS.export_metrics_desc,
+  folder: PARAMS.export_folder,
+  fileFormat: 'CSV'
+});
