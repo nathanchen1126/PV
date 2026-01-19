@@ -5,7 +5,7 @@ var PARAMS = {
   seed: 1,
   scale: 30,                  // 30m
   pos_samples_per_poly: 20,   // 每个Polygon取点
-  neg_pos_ratio: 4,           // 负样本=正样本*倍数
+  neg_pos_ratio: 3,           // 负样本=正样本*倍数
   pos_rect_size: 60,          // 真样本矩形边长60m
   neg_rect_size: 90,          // 假样本矩形边长90m
   split_ratio: 0.7,           // 7:3
