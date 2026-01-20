@@ -1,0 +1,260 @@
+// ============================================================
+// STEP 2: 模型训练、分类与导出 (修复投影问题 - EPSG:4326版)
+// ============================================================
+
+var embeddingAssetPath = 'projects/tiebian/assets/APV_emb_hz'; 
+
+// ========================
+// 0. 参数 
+// ========================
+var PARAMS = {
+  seed: 1,
+  scale: 30,                  // 30米 (GEE会自动处理投影转换)
+  pos_samples_per_poly: 20,   
+  neg_pos_ratio: 3,           
+  pos_rect_size: 60,          // 60米
+  neg_rect_size: 90,          // 90米
+  split_ratio: 0.7,           
+  rf_trees: 200,              
+  
+  // --- 模型投票权重参数 ---
+  prob_threshold: 0.7,        
+  weight_feature: 0.4,        
+  weight_embedding: 0.6,      
+  
+  // --- 波段选择参数 ---
+  viirs_threshold: 5,         
+  viirs_focal_radius_px: 1,   
+  min_patch_pixels: 4,        
+  morph_radius_m: 45,         // 45米
+  
+  export_folder: 'GEE_APV_hz',
+  export_image_desc: 'APV_hz_Result_Raster', 
+  export_metrics_desc: 'APV_hz_ACCURACYREPORT'
+};
+
+// --- 资产加载 ---
+// 简化几何以加快处理
+var roi = ee.FeatureCollection('users/nathanchen011126/climate_hz').geometry().simplify(100);
+var truePolysSource = ee.FeatureCollection('projects/tiebian/assets/apv_train_hz');
+var falsePointsSource = ee.FeatureCollection('projects/tiebian/assets/fake_nega_hz_balance'); 
+
+// 强制指定输入影像投影，防止 metadata 读取错误
+var featureImgRaw = ee.Image('projects/tiebian/assets/APV_allFeatures_S2_30m_hz')
+                      .setDefaultProjection('EPSG:4326'); 
+
+var embeddingOptimized = ee.Image(embeddingAssetPath)
+                           .setDefaultProjection('EPSG:4326');
+
+// --- 【修复重点】投影标准化 ---
+// 改为 EPSG:4326 (WGS 84)，避免 UTM 投影边缘转换错误
+var crs = 'EPSG:4326'; 
+
+// ========================
+// 1. 数据预处理与掩膜
+// ========================
+
+var viirs = ee.ImageCollection('NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG')
+  .filterDate('2023-01-01', '2023-12-31')
+  .select('avg_rad')
+  .median()
+  .clip(roi);
+
+// 【修复重点】: 移除了 .reproject()
+// 原代码在 EPSG:4326 下会导致 scale:500 变成 500度。
+// 这里直接使用 focal_max，GEE 会在需要的分辨率下自动重采样。
+var rural_mask = viirs.lt(PARAMS.viirs_threshold)
+  .focal_max({radius: PARAMS.viirs_focal_radius_px, units: 'pixels'})
+  .clip(roi);
+
+var featureBands = featureImgRaw.bandNames();
+var featureStack = featureImgRaw
+  .select(featureBands)
+  .updateMask(rural_mask)
+  .clip(roi);
+
+var embedBandsRaw = embeddingOptimized.bandNames();
+var embedBandsAll = embedBandsRaw.map(function(b){ 
+  return ee.String(b).match('^emb_').length().gt(0) ? b : ee.String('emb_').cat(ee.String(b)); 
+});
+
+var embedding = embeddingOptimized
+  .rename(embedBandsAll)
+  .updateMask(rural_mask)
+  .clip(roi);
+
+var bestEmbedBands = embedBandsAll;
+var optimizedStack = featureStack.addBands(embedding);
+
+// ========================
+// 2. 取样与数据集划分 
+// ========================
+
+var toRect = function(feature, size, label) {
+  var geom = feature.geometry();
+  // 使用 meters 单位的 buffer 在 4326 下也能正常工作，只要指定 errorMargin (默认即可)
+  return ee.Feature(geom.buffer(size / 2).bounds())
+    .set('class', label);
+};
+
+var truePoints = truePolysSource.map(function(poly){
+  return ee.FeatureCollection.randomPoints({
+    region: poly.geometry(),
+    points: PARAMS.pos_samples_per_poly,
+    seed: PARAMS.seed
+  });
+}).flatten();
+
+var trueRects = truePoints.map(function(f){ return toRect(f, PARAMS.pos_rect_size, 1); });
+
+var trueCount = trueRects.size();
+var falseCount = trueCount.multiply(PARAMS.neg_pos_ratio);
+
+var falseRects = falsePointsSource
+  .randomColumn('rand', PARAMS.seed)
+  .sort('rand')
+  .limit(falseCount)
+  .map(function(f){ return toRect(f, PARAMS.neg_rect_size, 0); });
+
+var allRects = trueRects.merge(falseRects);
+var allRectsWithSplit = allRects.randomColumn('split_rand', PARAMS.seed);
+
+var trainRects = allRectsWithSplit.filter(ee.Filter.lt('split_rand', PARAMS.split_ratio));
+var testRects  = allRectsWithSplit.filter(ee.Filter.gte('split_rand', PARAMS.split_ratio));
+
+// 采样区域
+// 虽然 projection 是 EPSG:4326，但 scale: 30 会告诉 GEE 以 30米的实际分辨率采样
+var trainSamples = optimizedStack.sampleRegions({
+  collection: trainRects,
+  properties: ['class'],
+  scale: PARAMS.scale,
+  projection: crs, 
+  tileScale: 16,
+  geometries: false
+});
+
+var testSamples = optimizedStack.sampleRegions({
+  collection: testRects,
+  properties: ['class'],
+  scale: PARAMS.scale,
+  projection: crs,
+  tileScale: 16,
+  geometries: false
+});
+
+// ========================
+// 3. 模型训练 
+// ========================
+
+var rfBase = ee.Classifier.smileRandomForest({
+  numberOfTrees: PARAMS.rf_trees, 
+  minLeafPopulation: 3,             
+  seed: PARAMS.seed
+});
+
+var rfFeature = rfBase.train(trainSamples, 'class', featureBands).setOutputMode('MULTIPROBABILITY');
+var rfEmbed   = rfBase.train(trainSamples, 'class', bestEmbedBands).setOutputMode('MULTIPROBABILITY');
+
+var addProbsAndPred = function(samples) {
+  return samples
+    .classify(rfFeature, 'feat_res')
+    .classify(rfEmbed, 'emb_res')
+    .map(function(f) {
+      var p_feat = ee.Array(f.get('feat_res')).get([1]);
+      var p_emb = ee.Array(f.get('emb_res')).get([1]);
+      var weighted_prob = p_feat.multiply(PARAMS.weight_feature)
+                            .add(p_emb.multiply(PARAMS.weight_embedding));
+      return f.set({
+        'pred': weighted_prob.gt(PARAMS.prob_threshold).int()
+      });
+    });
+};
+
+var getMetrics = function(fc, predProperty) {
+  var cm = fc.errorMatrix('class', predProperty);
+  return {
+    oa: cm.accuracy(),
+    kappa: cm.kappa(),
+    pa_pos: cm.producersAccuracy().get([1, 0]), 
+    ua_pos: cm.consumersAccuracy().get([0, 1])  
+  };
+};
+
+var trainPredFC = addProbsAndPred(trainSamples);
+var testPredFC  = addProbsAndPred(testSamples);
+
+var trainM = getMetrics(trainPredFC, 'pred');
+var testM  = getMetrics(testPredFC, 'pred');
+
+// ========================
+// 5. 全图分类与后处理
+// ========================
+
+var probFeat = featureStack.classify(rfFeature).arrayGet([1]);
+var probEmb  = embedding.select(bestEmbedBands).classify(rfEmbed).arrayGet([1]);
+var probFinal = probFeat.multiply(PARAMS.weight_feature)
+                  .add(probEmb.multiply(PARAMS.weight_embedding));
+
+var apvMask0 = probFinal.gt(PARAMS.prob_threshold).selfMask();
+
+// --- 后处理 ---
+var apvMaskSmooth = apvMask0.focal_mode({
+  radius: 2,
+  kernelType: 'square',
+  units: 'pixels',
+  iterations: 1
+});
+
+// 使用 meters 单位，GEE 会在任何投影下正确处理物理距离
+var morphKernel = {radius: PARAMS.morph_radius_m, units: 'meters'};
+var apvMaskMorph = apvMaskSmooth
+  .focal_min(morphKernel) 
+  .focal_max(morphKernel);
+
+var filterSmall = function(img, minPx) {
+  // connectedPixelCount 依赖像素连接性，在 4326 下可能需要注意
+  // 建议在导出前不强求严格投影，GEE 会动态计算
+  var count = img.connectedPixelCount({maxSize: 100, eightConnected: true});
+  return img.updateMask(count.gte(minPx));
+};
+
+var apvMaskFinal = filterSmall(apvMaskMorph, PARAMS.min_patch_pixels)
+  .clip(roi);
+
+// ========================
+// 6. 导出
+// ========================
+
+// 导出 Raster，使用 EPSG:4326，scale: 30
+Export.image.toDrive({
+  image: apvMaskFinal.toByte(), 
+  description: PARAMS.export_image_desc,
+  folder: PARAMS.export_folder,
+  region: roi,
+  scale: PARAMS.scale, // 30米
+  crs: crs,            // EPSG:4326
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+var accFeatures = ee.FeatureCollection([
+  ee.Feature(null, {
+    'Type': 'Train_Raw',
+    'OA': trainM.oa, 'Kappa': trainM.kappa, 'PA_Pos': trainM.pa_pos, 'UA_Pos': trainM.ua_pos
+  }),
+  ee.Feature(null, {
+    'Type': 'Test_Raw',
+    'OA': testM.oa, 'Kappa': testM.kappa, 'PA_Pos': testM.pa_pos, 'UA_Pos': testM.ua_pos
+  }),
+  ee.Feature(null, {
+    'Type': 'Note',
+    'Message': 'Fixed Projection: EPSG:4326. Skipped final validation.'
+  })
+]);
+
+Export.table.toDrive({
+  collection: accFeatures,
+  description: PARAMS.export_metrics_desc,
+  folder: PARAMS.export_folder,
+  fileFormat: 'CSV'
+});
