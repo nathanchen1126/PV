@@ -1,0 +1,120 @@
+// Read the post at
+// https://spatialthoughts.com/2024/10/23/large-image-exports-gee/
+
+// **************************************************************
+// Data Prep
+// **************************************************************
+
+// Select the country
+var country = lsib.filter(ee.Filter.eq('country_na', 'Estonia'));
+var geometry = country.geometry();
+
+// Select the image for Export
+var image = worldcover.first().clip(geometry);
+
+Map.addLayer(image, {}, 'Input Image');
+
+// **************************************************************
+// Create a Grid
+// **************************************************************
+
+// Choose the CRS
+var crs = 'EPSG:3301';
+
+// Choose the pixel size (meters)
+var pixelSize = 10;
+
+//Choose the export tile size (pixels)
+
+var tileSize = 10000;
+
+// Calculate the grid size (meters)
+var gridSize = ee.Number(tileSize).multiply(pixelSize);
+
+// Create the grid covering the geometry bounds
+var bounds = geometry.bounds({
+  'proj': crs, 'maxError': 1
+});
+
+var grid = bounds.coveringGrid({
+  'proj':crs, 'scale': gridSize
+});
+
+Map.addLayer(grid, {color: 'blue'}, 'Grid');
+
+// **************************************************************
+// Calculate the CRS Trandform
+// **************************************************************
+
+// Extract the coordinates of the grid
+var coordList = ee.Array.cat(bounds.coordinates(), 1); 
+
+var xCoords = coordList.slice(1, 0, 1);
+var yCoords = coordList.slice(1, 1, 2);
+
+// reduce the arrays to find the max (or min) value
+var xMin = xCoords.reduce('min', [0]).get([0,0])
+var yMax = yCoords.reduce('max', [0]).get([0,0])
+
+// Create the CRS Transform
+
+// The transform consists of 6 parameters: 
+// [xScale, xShearing, xTranslation, yShearing, yScale, yTranslation] 
+var transform = ee.List([pixelSize, 0, xMin, 0, -pixelSize, yMax]);
+
+
+// **************************************************************
+// Resample of Aggregate Pixels
+// **************************************************************
+
+// Uncomment below to enable resampling
+// This is not required for classification images
+// var image = image.resample('bicubic')
+
+// **************************************************************
+// Set a NoData Value
+// **************************************************************
+
+// Assign a no-data value
+var noDataValue = 0;
+var exportImage = image.unmask({
+    'value':noDataValue,
+    'sameFootprint': false
+});
+      
+var doExportDrive = function() {
+  // evaluate() transform to a client-side list
+  transform.evaluate(function(crs_transform) {
+    
+    
+    print('Using CRS Transform', crs_transform);
+    var ids = grid.aggregate_array('system:index');
+    // evaluate() ids to a client-side list
+    ids.evaluate(function(tile_ids) {
+      print('Total number of tiles', tile_ids.length);
+      print('Exporting now... (see Tasks tab)');
+      print('Tip: Use Ctrl+Click/Cmd+Click on tasks to skip confirmation.');
+      for(var i = 0; i < tile_ids.length; i++) {
+        var feature = ee.Feature(grid.toList(1, i).get(0));
+        var geometry = feature.geometry();
+  
+        // Clip image to the geometry
+        Export.image.toDrive({
+          image: exportImage,
+          description: 'Export_' + 'tile_' + tile_ids[i].replace(',', '_'),
+          folder: 'earthengine',
+          fileNamePrefix: 'tile_' + tile_ids[i].replace(',', '_'),
+          region: geometry,
+          crs: crs,
+          crsTransform: crs_transform,
+          maxPixels: 1e10
+        });
+      }
+    });
+  });
+};
+  
+
+print('Click button below to start export to Drive');
+var button = ui.Button({label: 'Export to Drive', onClick: doExportDrive});
+print(button);
