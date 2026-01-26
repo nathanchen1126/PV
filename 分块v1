@@ -1,0 +1,447 @@
+// ========================
+// 0. 参数与资产路径
+// ========================
+var PARAMS = {
+  seed: 1,
+  scale: 30,                  // 30m
+  pos_samples_per_poly: 20,   // 每个Polygon取点
+  neg_pos_ratio: 3,           // 负样本=正样本*倍数
+  pos_rect_size: 60,          // 真样本矩形边长60m
+  neg_rect_size: 90,          // 假样本矩形边长90m
+  split_ratio: 0.7,           // 7:3
+  rf_trees: 200,              // 200棵树
+  
+  // --- 模型投票权重参数 ---
+  prob_threshold: 0.7,        // 最终概率阈值
+  weight_feature: 0.4,        // 特征影像模型权重
+  weight_embedding: 0.6,      // Embedding模型权重
+  
+  // --- 波段选择参数 ---
+  top_k_bands: 20,            // 只选择前20个重要Embedding波段
+  
+  viirs_threshold: 5,         // 夜光阈值
+  viirs_focal_radius_px: 1,   // 夜光掩膜平滑半径(像素)
+  min_patch_pixels: 4,        // 斑块过滤：<4像素去除
+  morph_radius_m: 45,         // 形态学聚合（Closing）
+  
+  export_folder: 'GEE_APV_hz_merge',
+  export_vectors_desc: 'APV_hz_merge',
+  export_metrics_desc: 'APV_hz_ACCURACYREPORT_merge'
+};
+
+// --- 资产加载 ---
+var roi = ee.FeatureCollection('users/nathanchen011126/climate_hz').geometry().simplify(100);
+var truePolysSource = ee.FeatureCollection('projects/tiebian/assets/apv_train_hz');
+var falsePointsSource = ee.FeatureCollection('projects/tiebian/assets/fake_hz_point'); 
+var hardNegSource = ee.FeatureCollection('projects/tiebian/assets/nega_hz_add'); // 手动难例面资产
+var featureImgRaw = ee.Image('projects/tiebian/assets/APV_allFeatures_S2_30m_hz');
+
+// 嵌入数据
+var embeddingRaw = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL')
+  .filterDate('2023-01-01', '2024-01-01')
+  .filterBounds(roi)
+  .median();
+
+// --- 投影标准化 ---
+var baseProj = featureImgRaw.projection();
+var crs = baseProj.crs(); 
+
+// ========================
+// 1. 数据预处理与掩膜
+// ========================
+
+// 1.1 制作夜光掩膜
+var viirs = ee.ImageCollection('NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG')
+  .filterDate('2023-01-01', '2023-12-31')
+  .select('avg_rad')
+  .median()
+  .clip(roi);
+
+var rural_mask = viirs.lt(PARAMS.viirs_threshold)
+  .reproject({crs: crs, scale: 500}) 
+  .focal_max({radius: PARAMS.viirs_focal_radius_px, units: 'pixels'})
+  .reproject({crs: crs, scale: PARAMS.scale}) 
+  .clip(roi);
+
+// 1.2 准备特征影像
+var featureBands = featureImgRaw.bandNames();
+var featureStack = featureImgRaw
+  .select(featureBands)
+  .updateMask(rural_mask)
+  .clip(roi);
+
+// 1.3 准备Embedding影像
+var embedBandsRaw = embeddingRaw.bandNames();
+var embedBandsAll = embedBandsRaw.map(function(b){ return ee.String('emb_').cat(ee.String(b)); });
+var embedding = embeddingRaw
+  .select(embedBandsRaw)
+  .rename(embedBandsAll) 
+  .updateMask(rural_mask)
+  .clip(roi)
+  .reproject({crs: crs, scale: PARAMS.scale}); 
+
+// 1.4 组合全量堆栈
+var samplingStack = featureStack.addBands(embedding);
+
+// ========================
+// 2. 取样与数据集划分
+// ========================
+
+var toRect = function(feature, size, label) {
+  var geom = feature.geometry();
+  return ee.Feature(geom.buffer(size / 2).bounds())
+    .set('class', label);
+};
+
+// 2.1 真样本
+var truePoints = truePolysSource.map(function(poly){
+  return ee.FeatureCollection.randomPoints({
+    region: poly.geometry(),
+    points: PARAMS.pos_samples_per_poly,
+    seed: PARAMS.seed
+  });
+}).flatten();
+
+var trueRects = truePoints.map(function(f){ return toRect(f, PARAMS.pos_rect_size, 1); });
+
+// 2.2 负样本 (已按需修改：4倍基础负样本 + 每难例面15个点)
+var trueCount = trueRects.size();
+var baseFalseCount = trueCount.multiply(PARAMS.neg_pos_ratio);
+
+// A. 基础负样本：从格网中随机抽取 4倍 数量
+var falseRectsBase = falsePointsSource
+  .randomColumn('rand', PARAMS.seed)
+  .sort('rand')
+  .limit(baseFalseCount)
+  .map(function(f){ return toRect(f, PARAMS.neg_rect_size, 0); });
+
+// B. 手动难例：对每个难例面随机打 15 个点
+var hardNegPoints = hardNegSource.map(function(poly){
+  return ee.FeatureCollection.randomPoints({
+    region: poly.geometry(),
+    points: 10, 
+    seed: PARAMS.seed
+  });
+}).flatten();
+
+var hardNegRects = hardNegPoints.map(function(f){ 
+  return toRect(f, PARAMS.neg_rect_size, 0); 
+});
+
+// C. 合并负样本
+var falseRects = falseRectsBase.merge(hardNegRects);
+
+print('正样本数量:', trueCount);
+print('基础负样本数量:', falseRectsBase.size());
+print('额外难例负样本数量:', hardNegRects.size());
+
+// 2.3 合并与划分
+var allRects = trueRects.merge(falseRects);
+var allRectsWithSplit = allRects.randomColumn('split_rand', PARAMS.seed);
+
+var trainRects = allRectsWithSplit.filter(ee.Filter.lt('split_rand', PARAMS.split_ratio));
+var testRects  = allRectsWithSplit.filter(ee.Filter.gte('split_rand', PARAMS.split_ratio));
+
+// 2.4 提取像素值
+var trainSamples = samplingStack.sampleRegions({
+  collection: trainRects,
+  properties: ['class'],
+  scale: PARAMS.scale,
+  tileScale: 16,
+  geometries: false
+});
+
+var testSamples = samplingStack.sampleRegions({
+  collection: testRects,
+  properties: ['class'],
+  scale: PARAMS.scale,
+  tileScale: 16,
+  geometries: false
+});
+
+// ===========================================
+// 2.5 Embedding 波段选择
+// ===========================================
+
+var selectTopBands = function(samples, inputBands, topK) {
+  var shuffledSamples = samples
+    .randomColumn('temp_rand')
+    .sort('temp_rand')
+    .limit(5000);
+    
+  var selectorRF = ee.Classifier.smileRandomForest({
+    numberOfTrees: 30, 
+    seed: PARAMS.seed
+  }).train({
+    features: shuffledSamples, 
+    classProperty: 'class',
+    inputProperties: inputBands
+  });
+  
+  var importanceDict = selectorRF.explain().get('importance');
+  var kvList = ee.Dictionary(importanceDict).keys().map(function(key){
+    return ee.Feature(null, {
+      'band': key, 
+      'score': ee.Dictionary(importanceDict).get(key)
+    });
+  });
+  
+  var sortedFC = ee.FeatureCollection(kvList).sort('score', false);
+  return sortedFC.limit(topK).aggregate_array('band');
+};
+
+var bestEmbedBands = selectTopBands(trainSamples, embedBandsAll, PARAMS.top_k_bands);
+
+// ========================
+// 3. 模型训练
+// ========================
+
+var rfBase = ee.Classifier.smileRandomForest({
+  numberOfTrees: PARAMS.rf_trees, 
+  minLeafPopulation: 3,             
+  seed: PARAMS.seed
+});
+
+var rfFeature = rfBase.train({
+  features: trainSamples,
+  classProperty: 'class',
+  inputProperties: featureBands
+}).setOutputMode('MULTIPROBABILITY');
+
+var rfEmbed = rfBase.train({
+  features: trainSamples,
+  classProperty: 'class',
+  inputProperties: bestEmbedBands 
+}).setOutputMode('MULTIPROBABILITY');
+
+// ========================
+// 4. 原始精度验证
+// ========================
+
+var addProbsAndPred = function(samples) {
+  var s1 = samples.classify(rfFeature).map(function(f){
+    var probs = ee.Array(f.get('classification')); 
+    return f.set('prob_feat_pos', probs.get([1]));
+  });
+
+  var s2 = s1.classify(rfEmbed).map(function(f){
+    var probs = ee.Array(f.get('classification'));
+    var p_emb = ee.Number(probs.get([1]));
+    var p_feat = ee.Number(f.get('prob_feat_pos'));
+    var weighted_prob = p_feat.multiply(PARAMS.weight_feature)
+                          .add(p_emb.multiply(PARAMS.weight_embedding));
+    var is_pos = weighted_prob.gt(PARAMS.prob_threshold);
+    return f.set({
+      'prob_emb_pos': p_emb,
+      'pred': is_pos.int() 
+    });
+  });
+  return s2;
+};
+
+var getMetrics = function(fc, predProperty) {
+  var cm = fc.errorMatrix('class', predProperty);
+  return {
+    oa: cm.accuracy(),
+    kappa: cm.kappa(),
+    pa_pos: cm.producersAccuracy().get([1, 0]), 
+    ua_pos: cm.consumersAccuracy().get([0, 1])  
+  };
+};
+
+var trainPredFC = addProbsAndPred(trainSamples);
+var testPredFC  = addProbsAndPred(testSamples);
+
+var trainM = getMetrics(trainPredFC, 'pred');
+var testM  = getMetrics(testPredFC, 'pred');
+
+// ========================
+// 5. 全图分类与后处理 
+// ========================
+
+var probFeat = featureStack.classify(rfFeature).arrayGet([1]);
+var probEmb  = embedding.select(bestEmbedBands).classify(rfEmbed).arrayGet([1]);
+var probFinal = probFeat.multiply(PARAMS.weight_feature).add(probEmb.multiply(PARAMS.weight_embedding));
+
+var apvMask0 = probFinal.gt(PARAMS.prob_threshold).selfMask();
+
+var apvMaskSmooth = apvMask0.focal_mode({
+  radius: 2,
+  kernelType: 'square',
+  units: 'pixels',
+  iterations: 1
+});
+
+var morphKernel = {radius: PARAMS.morph_radius_m, units: 'meters'};
+var apvMaskClean = apvMaskSmooth.focal_min(morphKernel).focal_max(morphKernel);
+
+var filterSmall = function(img, minPx) {
+  var count = img.connectedPixelCount({maxSize: 100, eightConnected: true});
+  return img.updateMask(count.gte(minPx));
+};
+
+var apvMaskFiltered1 = filterSmall(apvMaskClean.reproject({crs: crs, scale: PARAMS.scale}), PARAMS.min_patch_pixels);
+var apvMaskClosed = apvMaskFiltered1.focal_max(morphKernel).focal_min(morphKernel);
+var apvMaskFinal = filterSmall(apvMaskClosed.reproject({crs: crs, scale: PARAMS.scale}), PARAMS.min_patch_pixels).clip(roi);
+
+// 5.6 后处理精度验证
+var finalMapForValidation = apvMaskFinal.unmask(0).rename('pred_final');
+var testSamplesFinal = finalMapForValidation.sampleRegions({
+  collection: testRects, 
+  properties: ['class'],
+  scale: PARAMS.scale,
+  tileScale: 16,
+  geometries: false
+});
+var metricsFinal = getMetrics(testSamplesFinal, 'pred_final');
+
+// ========================
+// 6. 导出 (原有的矢量和指标导出)
+// ========================
+
+var vectors = apvMaskFinal.toByte().reduceToVectors({
+  geometry: roi,
+  scale: PARAMS.scale,
+  crs: crs,
+  geometryType: 'polygon',
+  eightConnected: true,
+  labelProperty: 'class',
+  reducer: ee.Reducer.countEvery(),
+  maxPixels: 1e13,
+  tileScale: 16
+});
+
+Export.table.toDrive({
+  collection: vectors,
+  description: PARAMS.export_vectors_desc,
+  folder: PARAMS.export_folder,
+  fileFormat: 'SHP'
+});
+
+var accFeatures = ee.FeatureCollection([
+  ee.Feature(null, {'Type': 'Train_Raw', 'OA': trainM.oa, 'Kappa': trainM.kappa, 'PA_Pos': trainM.pa_pos, 'UA_Pos': trainM.ua_pos}),
+  ee.Feature(null, {'Type': 'Test_Raw', 'OA': testM.oa, 'Kappa': testM.kappa, 'PA_Pos': testM.pa_pos, 'UA_Pos': testM.ua_pos}),
+  ee.Feature(null, {'Type': 'Test_Final_PostProcessed', 'OA': metricsFinal.oa, 'Kappa': metricsFinal.kappa, 'PA_Pos': metricsFinal.pa_pos, 'UA_Pos': metricsFinal.ua_pos})
+]);
+
+Export.table.toDrive({
+  collection: accFeatures,
+  description: PARAMS.export_metrics_desc,
+  folder: PARAMS.export_folder,
+  fileFormat: 'CSV'
+});
+
+// ========================
+// 7. 分块导出栅格 (修复 Scale Too High 错误版)
+// ========================
+
+// 7.1 准备导出影像
+var exportImage = apvMaskFinal.unmask(0).toByte();
+
+// 7.2 定义分块网格参数 
+var pixelSize = PARAMS.scale; 
+var tileSize = 5000;  // 5000像素约150km
+// 计算网格的物理尺寸（米）
+var gridSize = ee.Number(tileSize).multiply(pixelSize);
+
+// 7.3 创建覆盖 ROI 的网格
+// 【核心修改 1】：为了避免经纬度(度)和米之间的混淆，
+// 我们强制使用 'EPSG:3857' (单位:米) 来生成分块网格。
+// 这只影响切块的形状，不影响导出数据的实际投影。
+var gridProj = 'EPSG:3857';
+
+var bounds = roi.bounds({
+  'proj': gridProj, 
+  'maxError': 1
+});
+
+var rawGrid = bounds.coveringGrid({
+  'proj': gridProj, 
+  'scale': gridSize
+});
+print('原始网格数量 (EPSG:3857):', rawGrid.size());
+
+// 过滤有效网格
+var grid = rawGrid.filter(ee.Filter.bounds(roi));
+
+Map.addLayer(rawGrid, {color: 'red', width: 1}, 'Excluded Tiles (Empty)', false);
+Map.addLayer(grid, {color: '00FFFF', width: 2}, 'Export Tiles (Valid)');
+print('当前分块大小(像素):', tileSize);
+
+// 7.4 (已删除) 手动计算 Transform 的步骤
+// 因为我们不再通过 Transform 强制指定分辨率，而是让 GEE 自动处理 Scale
+
+// 7.5 定义客户端导出触发函数
+var doExportDrive = function() {
+  print('正在初始化导出参数...');
+  
+  // 将 FeatureCollection 转为 List 下载
+  var gridList = grid.toList(1000); 
+
+  var payload = ee.Dictionary({
+    'crs_code': crs,          // 用户数据的原始投影 (可能是 EPSG:4326)
+    'tiles': gridList         
+  });
+
+  payload.evaluate(function(data) {
+    if (!data) {
+       print('Error: 无法获取导出参数 (Data is null)。');
+       return;
+    }
+
+    var crs_code = data.crs_code;  
+    var features = data.tiles; 
+
+    if (!features || features.length === 0) {
+       print('Error: 网格列表为空！');
+       return;
+    }
+
+    print('------------------------------------------------');
+    print('导出目标投影 (CRS):', crs_code);
+    print('导出分辨率 (Scale):', PARAMS.scale + ' 米');
+    print('优化后需导出的分块数:', features.length);
+    print('正在生成任务，请查看 Tasks 标签页...');
+
+    for (var i = 0; i < features.length; i++) {
+      var clientFeature = features[i];
+      
+      // 获取 ID
+      var tileId = clientFeature.id; 
+      if (!tileId && clientFeature.properties) {
+          tileId = clientFeature.properties['system:index'];
+      }
+      if (!tileId) tileId = i.toString(); 
+
+      // 获取当前分块的几何范围
+      var tileGeometry = ee.Geometry(clientFeature.geometry);
+
+      // 构造文件名
+      var tileIdClean = tileId.replace(',', '_');
+      var fileName = PARAMS.export_vectors_desc + '_Raster_Tile_' + tileIdClean;
+
+      // 【核心修改 2】：导出配置
+      // 1. 移除 crsTransform (它导致了 Scale error)
+      // 2. 使用 scale: PARAMS.scale (30米)，GEE 会自动适配投影
+      Export.image.toDrive({
+        image: exportImage,
+        description: fileName,
+        folder: PARAMS.export_folder,
+        fileNamePrefix: fileName,
+        region: tileGeometry, 
+        crs: crs_code,           // 保持原始投影 (如 EPSG:4326)
+        scale: PARAMS.scale,     // 30米
+        maxPixels: 1e13
+      });
+    }
+    print('任务创建完成！请点击 Tasks 栏的 Run 按钮。');
+  });
+};
+
+// 7.6 添加 UI 按钮
+print('=========== 分块导出工具 ===========');
+var button = ui.Button({
+  label: '开始优化导出 (修复 Scale Error)', 
+  onClick: doExportDrive
+});
+print(button);
